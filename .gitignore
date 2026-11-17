@@ -1,0 +1,10 @@
+.env
+data/
+!seed/
+__pycache__/
+*.pyc
+.cache/
+.local/
+
+# Railway/Nixpacks build snapshots (generated on every build, can contain secrets)
+.nixpacks/
