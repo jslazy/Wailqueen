@@ -1,11 +1,11 @@
 """Anti-nuke: live backup of the whole server + nuke protection + one-click restore.
 
-* Every second (AN_TICK_SECONDS) the server structure (roles, categories, channels, permissions) is
-  read from the gateway cache and saved when it changed; every message (also bots / webhooks), image,
-  file and link is saved the moment it is sent (real-time events -> database, flushed every second).
+* Every second (AN_TICK_SECONDS) the server structure (categories, channels, permissions) is
+  read from the gateway cache and saved when it changed; every message (also bots / webhooks) and its
+  links are saved the moment it is sent (real-time events -> database, flushed every second).
   Old history is back-filled in the background when protection is turned on.
-* The backup is mirrored to the webhook that is set in the panel (live status message + alerts +
-  full archive every few minutes).
+* Everything is stored inside the bot's own database (AN_DB_PATH). No zip, no downloaded files.
+* Optional: a webhook set in the panel gets a small live status message + alerts.
 * Deleting a channel (voice channels excluded) starts a 2 hour cooldown for that person. A second
   delete inside the cooldown = punishment + automatic restore. Mass bans / kicks / role or channel
   spam / bot adds / webhook spam / message wipes are punished too.
@@ -19,13 +19,9 @@ import io
 import json
 import logging
 import re
-import shutil
-import tempfile
 import time
-import zipfile
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -34,7 +30,6 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
-from utils import nukeimport
 from utils import nukerestore as restore
 from utils.icons import icon
 from utils.nukestore import VOICE_TYPES, Store, build_snapshot, channel_data, digest_of, role_data, serialize_message
@@ -42,7 +37,6 @@ from utils.nukestore import VOICE_TYPES, Store, build_snapshot, channel_data, di
 log = logging.getLogger("premium-bot.antinuke")
 
 WEBHOOK_RE = re.compile(r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/(?:v\d+/)?webhooks/\d+/[\w-]+")
-ARCHIVE_PART = 8 * 1024 * 1024
 PUNISH = {"ban": "Ban the person", "kick": "Kick the person", "strip": "Remove all their roles"}
 EVENT_TITLES = {
     "channel_delete": "Channel deleted", "channel_blocked": "Channel delete BLOCKED", "channel_missing": "Channel missing",
@@ -68,17 +62,15 @@ class AntiNuke(commands.Cog):
         self.known: dict[int, dict] = {}
         self.digest: dict[int, str] = {}
         self.state: dict[int, dict] = defaultdict(lambda: {
-            "missing": {}, "alerts": [], "last_push": 0.0, "last_tick": 0.0, "snap_gz": b"", "archiving": False,
-            "wh_retry": 0.0, "wh_error": "", "snap_hash": None, "archive_msgs": [], "backfill": None, "restore": None,
+            "missing": {}, "alerts": [], "last_push": 0.0, "last_tick": 0.0, "snap_gz": b"",
+            "wh_retry": 0.0, "wh_error": "", "snap_hash": None, "backfill": None, "restore": None,
         })
         self.hits: dict[tuple, deque] = defaultdict(deque)
         self.victims: dict[tuple, list[int]] = defaultdict(list)
         self.wipes: dict[int, dict] = {}
         self.punished_at: dict[tuple, float] = {}
-        self.dl_sem = asyncio.Semaphore(4)
         self.restoring: dict[int, int] = defaultdict(int)  # guild id -> restores running (create-listener stays out)
         self.restore_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
-        self.upload_wait: set[tuple[int, int]] = set()  # (channel, user) that is about to upload an antinuke.zip
         self.tasks_: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------ lifecycle
@@ -154,36 +146,10 @@ class AntiNuke(commands.Cog):
             await asyncio.to_thread(self.store.mark_messages_deleted, dels)
 
     def _capture(self, message: discord.Message) -> None:
-        self.msg_queue.append(serialize_message(message))
-        if message.attachments:
-            self._spawn(self._download(message))
-
-    async def _download(self, message: discord.Message) -> None:
-        saved = []
-        base = Path(config.AN_FILES_DIR) / str(message.guild.id)  # type: ignore[union-attr]
-        async with self.dl_sem:
-            for a in message.attachments:
-                entry = {"id": a.id, "filename": a.filename, "url": a.url, "size": a.size,
-                         "content_type": a.content_type, "local": None}
-                path = base / f"{a.id}_{re.sub(r'[^A-Za-z0-9._-]', '_', a.filename)[:80]}"
-                try:
-                    if path.exists():
-                        entry["local"] = str(path)
-                    elif a.size <= config.AN_MAX_FILE_MB * 1024 * 1024:
-                        data = await a.read()
-                        base.mkdir(parents=True, exist_ok=True)
-                        await asyncio.to_thread(path.write_bytes, data)
-                        entry["local"] = str(path)
-                except (discord.HTTPException, OSError):
-                    pass
-                saved.append(entry)
-        await self.flush()  # make sure the row exists before the file paths are attached
-        await asyncio.to_thread(self.store.set_attachments, message.id, saved)
+        self.msg_queue.append(serialize_message(message))  # text + embeds + attachment LINKS only (no file downloads)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
-        if message.attachments and (message.channel.id, message.author.id) in self.upload_wait:
-            return  # an antinuke.zip upload: never store the archive inside the backup itself
         if message.guild and message.guild.id in self.enabled:
             self._capture(message)
 
@@ -309,10 +275,6 @@ class AntiNuke(commands.Cog):
         st["last_tick"] = now
         cfg = self.store.cfg(gid)
         await self._mirror(guild, cfg, changed, force=force)
-        if cfg["webhook_url"] and not st["archiving"] and now - cfg["last_archive_ts"] >= config.AN_ARCHIVE_MINUTES * 60:
-            st["archiving"] = True
-            self.store.set_cfg(gid, last_archive_ts=now)
-            self._spawn(self._archive(guild, cfg))
 
     # ------------------------------------------------------------------ events + webhook mirror
     async def _event(self, guild: discord.Guild, kind: str, details: dict, *, alert: bool = True) -> int:
@@ -374,8 +336,7 @@ class AntiNuke(commands.Cog):
                 f"📁 Channels: **{counts['channels']}** • Roles: **{counts['roles']}**\n"
                 f"💬 Messages saved: **{counts['messages']:,}** (deleted but kept: {counts['deleted_messages']:,})\n"
                 f"🗄️ Structure versions: **{counts['snapshots']}** • Deleted channels waiting: **{counts['deleted_channels']}**")
-            embed.set_footer(text="structure.json.gz = whole server structure • full archive every "
-                                  f"{config.AN_ARCHIVE_MINUTES} min")
+            embed.set_footer(text="structure.json.gz = whole server structure • the real backup lives inside the bot")
             files = [discord.File(io.BytesIO(st["snap_gz"]), filename="structure.json.gz")] if st["snap_gz"] else []
             done = False
             if cfg["webhook_msg_id"]:
@@ -393,44 +354,6 @@ class AntiNuke(commands.Cog):
             st["wh_error"] = f"{type(exc).__name__} {getattr(exc, 'status', '')}".strip()
             st["wh_retry"] = now + 30
             log.warning("Anti-nuke webhook failed: %s", st["wh_error"])
-
-    async def _archive(self, guild: discord.Guild, cfg: dict) -> None:
-        """Zip of the whole backup database + files saved since the last archive, sent in 8 MB parts."""
-        st = self.state[guild.id]
-        try:
-            since = cfg["last_archive_ts"] - config.AN_ARCHIVE_MINUTES * 60 - 60
-
-            def build() -> bytes:
-                buf = io.BytesIO()
-                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-                    zf.writestr("antinuke.db", self.store.export_guild_bytes(guild.id))
-                    base = Path(config.AN_FILES_DIR) / str(guild.id)
-                    if base.exists():
-                        for p in base.iterdir():
-                            if p.is_file() and p.stat().st_mtime >= since:
-                                zf.write(p, f"files/{p.name}")
-                return buf.getvalue()
-
-            data = await asyncio.to_thread(build)
-            hook = discord.Webhook.from_url(cfg["webhook_url"], session=self.session)  # type: ignore[arg-type]
-            for old in st["archive_msgs"]:
-                try:
-                    await hook.delete_message(old)
-                except discord.HTTPException:
-                    pass
-            st["archive_msgs"] = []
-            parts = [data[i:i + ARCHIVE_PART] for i in range(0, len(data), ARCHIVE_PART)] or [b""]
-            for n, part in enumerate(parts, 1):
-                name = f"antinuke-{guild.id}.zip" + (f".part{n}" if len(parts) > 1 else "")
-                msg = await hook.send(
-                    content=f"📦 Full archive {n}/{len(parts)} • {ts_fmt(time.time(), 'f')}",
-                    file=discord.File(io.BytesIO(part), filename=name), wait=True,
-                    username=f"{config.BOT_NAME} Anti-Nuke")
-                st["archive_msgs"].append(msg.id)
-        except Exception as exc:
-            log.warning("Archive failed: %s", type(exc).__name__)
-        finally:
-            st["archiving"] = False
 
     # ------------------------------------------------------------------ nuke detection
     def _hit(self, guild_id: int, user_id: int, kind: str) -> bool:
@@ -717,124 +640,6 @@ class AntiNuke(commands.Cog):
         return (f"{counts['channels']} channels, {counts['roles']} roles, {counts['messages']:,} messages saved "
                 f"({counts['snapshots']} structure versions).")
 
-    # ------------------------------------------------------------------ antinuke.zip: refresh + upload
-    async def send_archive(self, interaction: discord.Interaction) -> None:
-        """Build a fresh FULL antinuke.zip (database + every saved file) and send it to the person (ephemeral).
-        The webhook archive is refreshed as well (full, not only the newest files)."""
-        guild = interaction.guild
-        assert guild is not None
-        await self.flush()
-        if guild.id in self.enabled:
-            try:
-                await asyncio.wait_for(self._tick_guild(guild, force=True), 20)
-            except Exception:
-                log.exception("Structure backup before the archive failed")
-        path = await asyncio.to_thread(nukeimport.build_full_archive, self.store, guild.id, Path(config.AN_FILES_DIR))
-        try:
-            size = min(ARCHIVE_PART, max(1024 * 1024, int(getattr(guild, "filesize_limit", 0) or ARCHIVE_PART) - 256 * 1024))
-            total = path.stat().st_size
-            parts = max(1, -(-total // size))
-            if self.store.cfg(guild.id)["webhook_url"]:
-                self.store.set_cfg(guild.id, last_archive_ts=0)  # the webhook posts a fresh full archive in a second
-            if parts > 25:
-                return await interaction.followup.send(
-                    f"{icon('warn')} The archive is {total / 1048576:,.0f} MB - too big to send here. "
-                    "The backup webhook keeps the full archive.", ephemeral=True)
-            await interaction.followup.send(
-                f"{icon('ok')} **antinuke.zip** refreshed ({total / 1048576:,.1f} MB"
-                + (f", {parts} parts - upload all parts together in one message" if parts > 1 else "") + "). "
-                "Keep it private: it contains every saved message and file of this server.", ephemeral=True)
-            with open(path, "rb") as fh:
-                for i in range(1, parts + 1):
-                    name = "antinuke.zip" if parts == 1 else f"antinuke.zip.part{i}"
-                    await interaction.followup.send(file=discord.File(io.BytesIO(fh.read(size)), filename=name),
-                                                    ephemeral=True)
-        finally:
-            path.unlink(missing_ok=True)
-
-    async def upload_archive(self, interaction: discord.Interaction) -> None:
-        """Wait for an antinuke.zip attachment, merge it into the backup and restore everything that is missing."""
-        guild, user = interaction.guild, interaction.user
-        assert guild is not None
-        key = (interaction.channel_id or 0, user.id)
-        if key in self.upload_wait:
-            return await interaction.response.send_message(f"{icon('hourglass')} Already waiting for your file.", ephemeral=True)
-        await interaction.response.send_message(
-            f"{icon('file')} Send your **antinuke.zip** now: attach it to a message in this channel (within 3 minutes). "
-            "A zip that came in parts (`.part1`, `.part2`...) - attach all parts to the same message. "
-            "I delete your message right after reading it.", ephemeral=True)
-
-        def check(m: discord.Message) -> bool:
-            return m.author.id == user.id and m.channel.id == interaction.channel_id and bool(m.attachments)
-
-        self.upload_wait.add(key)
-        msgs: list[discord.Message] = []
-        try:
-            try:
-                msgs.append(await self.bot.wait_for("message", check=check, timeout=180))
-            except asyncio.TimeoutError:
-                return await interaction.followup.send(f"{icon('error')} Timed out - press the button again.", ephemeral=True)
-            if any(nukeimport.PART_RE.search(a.filename) for a in msgs[0].attachments):
-                while True:  # parts may also come in several messages
-                    try:
-                        msgs.append(await self.bot.wait_for("message", check=check, timeout=20))
-                    except asyncio.TimeoutError:
-                        break
-            tmpdir = Path(tempfile.mkdtemp(prefix="antinuke_up_"))
-            try:
-                saved: list[tuple[str, Path]] = []
-                for m in msgs:
-                    for a in m.attachments:
-                        if a.size > 300 * 1024 * 1024:
-                            await interaction.followup.send(f"{icon('error')} `{a.filename}` is too big.", ephemeral=True)
-                            continue
-                        dest = tmpdir / f"{len(saved)}_{re.sub(r'[^A-Za-z0-9._-]', '_', a.filename)[:80]}"
-                        await a.save(dest)
-                        saved.append((a.filename, dest))
-                for m in msgs:  # the archive holds the whole server: do not leave it in the channel
-                    try:
-                        await m.delete()
-                    except discord.HTTPException:
-                        pass
-                if not saved:
-                    return await interaction.followup.send(f"{icon('error')} No usable file received.", ephemeral=True)
-                await interaction.followup.send(f"{icon('hourglass')} Reading the archive...", ephemeral=True)
-                archives = await asyncio.to_thread(nukeimport.group_uploads, saved)
-                allow_other = await self.bot.is_owner(user)
-                total = {"messages": 0, "channels_missing": 0, "roles_missing": 0, "files": 0}
-                for arc in archives:
-                    try:
-                        rep = await asyncio.to_thread(
-                            nukeimport.import_archive, self.store, arc, guild.id, Path(config.AN_FILES_DIR),
-                            channel_ids={c.id for c in guild.channels}, role_ids={r.id for r in guild.roles},
-                            allow_other_server=allow_other)
-                    except nukeimport.ArchiveError as exc:
-                        await interaction.followup.send(f"{icon('error')} {exc}", ephemeral=True)
-                        continue
-                    except Exception:
-                        log.exception("Archive import failed")
-                        await interaction.followup.send(f"{icon('error')} Could not read this archive.", ephemeral=True)
-                        continue
-                    for k in total:
-                        total[k] += rep.get(k, 0)
-                    self.known.pop(guild.id, None)  # structure cache: reload it from the merged database
-            finally:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-        finally:
-            self.upload_wait.discard(key)
-
-        if not (total["messages"] or total["channels_missing"] or total["roles_missing"] or total["files"]):
-            return await interaction.followup.send(f"{icon('ok')} Nothing new in this archive - everything in it was already saved.", ephemeral=True)
-        line = (f"{icon('ok')} Archive loaded: **{total['messages']:,}** messages, **{total['files']:,}** files, "
-                f"**{total['channels_missing']}** missing channel(s), **{total['roles_missing']}** missing role(s).")
-        st = self.state[guild.id]
-        if st["restore"] and st["restore"]["running"]:
-            return await interaction.followup.send(line + f"\n{icon('hourglass')} A restore is already running - "
-                                                   "open **Backup details** afterwards for the rest.", ephemeral=True)
-        await interaction.followup.send(line + f"\n{icon('restore')} Restoring everything that is missing now. "
-                                        "I post here when it is finished.", ephemeral=True)
-        self._spawn(self.run_restore(guild, interaction.channel, "all"))  # type: ignore[arg-type]
-
     # ------------------------------------------------------------------ panel
     def panel_embed(self, guild: discord.Guild) -> discord.Embed:
         cfg = self.store.cfg(guild.id)
@@ -946,15 +751,6 @@ class PanelView(Gate):
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, row=1, emoji=icon("recycle") or None)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._refresh(interaction)
-
-    @discord.ui.button(label="Upload antinuke.zip", style=discord.ButtonStyle.success, row=2, emoji=icon("folder") or None)
-    async def upload_zip(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self.cog.upload_archive(interaction)
-
-    @discord.ui.button(label="Refresh antinuke.zip", style=discord.ButtonStyle.secondary, row=2, emoji=icon("file") or None)
-    async def refresh_zip(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.cog.send_archive(interaction)
 
     async def on_timeout(self) -> None:
         for child in self.children:

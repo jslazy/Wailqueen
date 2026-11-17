@@ -12,7 +12,6 @@ BOT_NAME=WailQueen
 AUTO_SYNC=1
 DB_PATH=/data/bot.db
 AN_DB_PATH=/data/antinuke.db
-AN_FILES_DIR=/data/antinuke_files
 BACKUP_WEBHOOK_URL=your_private_webhook_url
 BACKUP_WEBHOOK_MODE=edit
 BACKUP_WEBHOOK_INTERVAL=60

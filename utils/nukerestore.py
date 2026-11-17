@@ -1,4 +1,5 @@
-"""Rebuild a server from the anti-nuke backup: roles, categories, channels and every saved message."""
+"""Rebuild a server from the anti-nuke backup: roles, categories, channels and every saved message
+(posted back with the original name + profile picture)."""
 from __future__ import annotations
 
 import asyncio
@@ -114,8 +115,7 @@ async def _create_channel(guild: discord.Guild, d: dict, category, roles: dict[i
 
 def find_clone(guild: discord.Guild, obj: dict, exclude: frozenset | set = frozenset()) -> Optional[discord.abc.GuildChannel]:
     """A channel with the same name/type that was created after the original was deleted (nuke 'clone').
-    Objects loaded from an uploaded antinuke.zip (deleted_by == 0) accept any same-name channel, because the
-    real deletion time is unknown. A channel that already is the restored copy of another object is never reused."""
+    A channel that already is the restored copy of another object is never reused."""
     deleted_at = obj.get("deleted_at") or 0
     imported = obj.get("deleted_by") == 0
     for ch in guild.channels:
@@ -236,15 +236,41 @@ def _safe_filename(name: str) -> str:
     return name
 
 
+def _hook_name(name: str) -> str:
+    """Webhook usernames: 1-80 chars and must not contain 'discord' / 'clyde' (Discord rejects them)."""
+    name = (name or "Unknown").strip() or "Unknown"
+    name = re.sub(r"(?i)discord", lambda m: m.group(0).replace("i", "\u0456").replace("I", "\u0406"), name)
+    name = re.sub(r"(?i)clyde", lambda m: m.group(0).replace("c", "\u0441").replace("C", "\u0421"), name)
+    return name[:80]
+
+
 class _Poster:
-    """Posts one saved message back into the restored channel. NO webhook: the bot itself posts, and every
-    message is an embed that shows the original author (name + avatar), the original text, the original
-    pictures / files and the ORIGINAL date + time (embed timestamp).
-    Discord does not let a bot post as another person or back-date a message, so this is the closest possible."""
+    """Posts one saved message back into the restored channel AS THE ORIGINAL PERSON: a temporary channel
+    webhook is used, so every message shows the original name + profile picture and the original text
+    (plus original embeds / files). The webhook is deleted again when the channel is done.
+    If the bot may not create webhooks (no Manage Webhooks) it falls back to bot-posted embeds."""
 
     def __init__(self, channel: discord.abc.Messageable) -> None:
         self.channel = channel
+        self.hook: Optional[discord.Webhook] = None
+        self.hook_failed = False
         self.error = ""
+
+    @property
+    def chunk(self) -> int:
+        """Max text per message: webhook messages hold 2000 characters, embed fallback 4000."""
+        return 1990 if self.hook is not None else EMBED_TEXT
+
+    async def prepare(self) -> None:
+        if self.hook is not None or self.hook_failed:
+            return
+        try:
+            self.hook = await self.channel.create_webhook(  # type: ignore[attr-defined]
+                name="Restore", reason="Anti-nuke restore: posting saved messages as their authors")
+        except Exception as exc:  # no permission / channel type without webhooks
+            self.hook_failed = True
+            self.error = _why(exc)
+            log.warning("Webhook for restore could not be created (%s): using embeds instead", self.error)
 
     @staticmethod
     def _embed(author: str, avatar: Optional[str], ts: Optional[float], text: str,
@@ -257,11 +283,66 @@ class _Poster:
             embed.set_image(url=f"attachment://{image}")
         return embed
 
-    async def close(self) -> None:  # kept so callers stay simple (nothing to clean up without a webhook)
-        return None
+    async def close(self) -> None:
+        if self.hook is not None:
+            try:
+                await self.hook.delete(reason="Anti-nuke restore finished")
+            except discord.HTTPException:
+                pass
+            self.hook = None
+
+    async def _via_webhook(self, author: str, avatar: Optional[str], content: str,
+                           embeds: list[discord.Embed], files: list[tuple[bytes, str, str]]) -> bool:
+        """Same name + same avatar + same text. Tries: with embeds+files, without embeds, links instead of files."""
+        steps = [(True, True)]
+        if embeds:
+            steps.append((False, True))
+        if files:
+            steps.append((False, False))
+        seen: set[tuple] = set()
+        for with_embeds, with_files in steps:
+            key = (with_embeds and bool(embeds), with_files and bool(files))
+            if key in seen:
+                continue
+            seen.add(key)
+            text = content
+            if files and not with_files:  # files could not go along: keep their links in the text
+                text = (text + "\n" + "\n".join(u for _, _, u in files if u)).strip()
+            use_embeds = embeds[:10] if with_embeds else []
+            use_files = files if with_files else []
+            if not text and not use_embeds and not use_files:
+                continue
+            kwargs: dict = {"username": _hook_name(author), "allowed_mentions": discord.AllowedMentions.none()}
+            if avatar:
+                kwargs["avatar_url"] = avatar
+            if text:
+                kwargs["content"] = text[:2000]
+            if use_embeds:
+                kwargs["embeds"] = use_embeds
+            if use_files:
+                kwargs["files"] = [discord.File(io.BytesIO(b), filename=_safe_filename(n)) for b, n, _ in use_files]
+            try:
+                await self.hook.send(**kwargs)  # type: ignore[union-attr]
+                return True
+            except discord.NotFound:  # the webhook (or channel) is gone: stop using it
+                self.hook, self.hook_failed = None, True
+                return False
+            except discord.HTTPException as exc:
+                self.error = _why(exc)
+            except Exception as exc:  # bad data: try the next, simpler step
+                self.error = _why(exc)
+        return False
 
     async def deliver(self, author: str, avatar: Optional[str], ts: Optional[float], content: str,
                       extra_embeds: list[discord.Embed], files: list[tuple[bytes, str, str]]) -> bool:
+        await self.prepare()
+        if self.hook is not None and await self._via_webhook(author, avatar, content, extra_embeds, files):
+            return True
+        return await self._deliver_embed(author, avatar, ts, content, extra_embeds, files)
+
+    async def _deliver_embed(self, author: str, avatar: Optional[str], ts: Optional[float], content: str,
+                             extra_embeds: list[discord.Embed], files: list[tuple[bytes, str, str]]) -> bool:
+        """Fallback when no webhook can be used: the bot posts an embed with the author's name + avatar."""
         names = [_safe_filename(n) for _, n, _ in files]
         image = next((n for n in names if n.lower().endswith(IMAGE_EXT)), None)
         plans = [(True, True, True)]  # (original embeds, attachments, picture inside the embed)
@@ -277,7 +358,7 @@ class _Poster:
                 continue
             seen.add(key)
             text = content
-            if files and not with_files:  # files could not go along: keep their links in the text
+            if files and not with_files:
                 text = (text + "\n" + "\n".join(u for _, _, u in files if u)).strip()
             try:
                 kwargs: dict = {"allowed_mentions": discord.AllowedMentions.none()}
@@ -307,13 +388,14 @@ async def repost_messages(guild: discord.Guild, store: Store, source_channel_id:
                           until: Optional[float] = None, progress: Optional[Progress] = None,
                           stats: Optional[dict] = None) -> int:
     """Post saved messages of `source_channel_id` into `channel`, oldest first, with the original
-    name + avatar + original time (bot-posted embeds, no webhook). Restored messages are marked and skipped; failed ones stay queued for a retry.
+    name + avatar (posted through a temporary webhook; embeds only if no webhook is possible). Restored messages are marked and skipped; failed ones stay queued for a retry.
     `stats` (optional dict) receives 'failed' (count) and 'error' (last reason)."""
     stats = stats if stats is not None else {}
     stats.setdefault("failed", 0)
     stats.setdefault("error", "")
     limit = int(getattr(guild, "filesize_limit", 0) or DEFAULT_FILE_LIMIT)
     poster = _Poster(channel)
+    await poster.prepare()  # webhook first, so the text is split to the right size
     sent, after = 0, 0
     try:
         while True:
@@ -337,7 +419,7 @@ async def repost_messages(guild: discord.Guild, store: Store, source_channel_id:
                     if not text and not embeds and not files:
                         done_ids.append(row["message_id"])
                         continue
-                    parts = _chunks(text, EMBED_TEXT)
+                    parts = _chunks(text, poster.chunk)
                     ok = True
                     for n, part in enumerate(parts):
                         last = n == len(parts) - 1

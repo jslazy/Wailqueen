@@ -131,12 +131,7 @@ TICKET_DEFAULT_CATEGORIES = [
 
 # ---------------- Anti-nuke (cogs/antinuke.py) ----------------
 AN_DB_PATH = _path("AN_DB_PATH", "data/antinuke.db")
-AN_FILES_DIR = _path("AN_FILES_DIR", "data/antinuke_files")  # downloaded images / files of every message
-if Path(AN_FILES_DIR) == Path(AN_DB_PATH):  # a wrong host variable (files dir set to the db file) would break every file save
-    AN_FILES_DIR = str(Path(AN_DB_PATH).parent / "antinuke_files")
-AN_MAX_FILE_MB = int(os.getenv("AN_MAX_FILE_MB", "25"))           # bigger attachments are kept as links only
 AN_TICK_SECONDS = 1                                               # structure backup + webhook mirror interval
-AN_ARCHIVE_MINUTES = int(os.getenv("AN_ARCHIVE_MINUTES", "10"))   # full archive (messages + files) sent to the webhook
 AN_CHANNEL_DELETE_COOLDOWN = 2 * 3600                             # after deleting 1 channel, the next delete within 2h is punished
 AN_SNAPSHOT_HISTORY = 100                                         # structure versions kept per server
 # action -> (how many, within how many seconds) before it counts as a nuke attempt

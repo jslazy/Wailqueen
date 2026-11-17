@@ -129,11 +129,11 @@ Only the server owner, the bot owner and trusted users can open it. Everybody el
 
 Panel buttons: **Enable/Disable protection**, **Set webhook** (paste the webhook link), **Backup now**, **Backup details & restore**, **Settings** (punishment, auto restore, trusted users), **Refresh**.
 
-* Backup: every second the server structure (roles, categories, channels, permissions) is saved; every message (users, bots, webhooks), image, file and link is saved the moment it is sent. Old history is back-filled in the background. Files are in `data/antinuke_files`, everything else in `data/antinuke.db`.
-* Webhook: live status message (edited every second when something changed) + `structure.json.gz`, alerts for deleted channels / nukes, and a full archive every `AN_ARCHIVE_MINUTES`. Keep that channel private.
+* Backup: every second the server structure (roles, categories, channels, permissions) is saved; every message (users, bots, webhooks) and its links is saved the moment it is sent. Old history is back-filled in the background. Only messages + channels (and the roles their permissions need) are saved, no files are downloaded. Everything lives inside the bot in `data/antinuke.db` (no zip).
+* Webhook: live status message (edited every second when something changed) + `structure.json.gz`, and alerts for deleted channels / nukes. Optional. Keep that channel private.
 * Channel delete cooldown: deleting one channel (voice channels excluded) starts a 2 hour cooldown for that person. A second delete in that time = punishment + the channel and its messages are restored automatically.
 * Also watched: mass ban / kick, role + channel + webhook spam, bots added by non-trusted people, channels "nuked" by delete + clone, messages wiped from a channel.
-* Restore: panel > Backup details & restore > pick a deleted channel / role / wipe, or restore everything. Channels are rebuilt with permissions, messages are re-posted with the original name, avatar, embeds and images.
+* Restore: panel > Backup details & restore > pick a deleted channel / role / wipe, or restore everything. Channels are rebuilt with permissions, messages are re-posted with the original name, avatar and text (through a temporary webhook).
 * Needs the permissions: Administrator (or Manage Channels, Manage Roles, Manage Webhooks, Ban/Kick Members, View Audit Log) and a bot role placed ABOVE the roles it must punish.
 
 ## Badge emojis
@@ -147,13 +147,11 @@ Panel buttons: **Enable/Disable protection**, **Set webhook** (paste the webhook
 
 
 ## Anti-nuke restore (how messages come back)
-When a deleted channel is restored, every saved message is posted back **by the bot itself (no webhook)** as an embed:
-original author name + avatar, original text, original pictures / files and the original date + time (embed timestamp).
-Discord does not allow a bot to post as another person or to back-date a message, so this is the closest possible.
+When a deleted channel is restored, every saved message is posted back through a temporary channel webhook, so it shows the
+**same name + same profile picture + same text** as the original (original embeds are sent along, attachments come back as links).
+The webhook is deleted again after the channel is done. Needs the **Manage Webhooks** permission; without it the bot falls back to
+embeds that show the author's name + avatar.
 Messages that fail stay saved; open `!antinuke` > Backup Details > "Retry messages" to try again.
 
-## antinuke.zip (panel buttons)
-In `!antinuke` (row 3):
-* **Upload antinuke.zip** - press it, then attach your `antinuke.zip` (or all `.partN` files) to a message in the same channel within 3 minutes. The bot reads it, deletes your message, merges every message / file / channel / role into the backup and then restores everything that is missing (channels with all their messages). Nothing that already exists is overwritten; loading the same zip twice adds nothing.
-* **Refresh antinuke.zip** - builds a fresh full archive (database + all saved files) and sends it to you privately (ephemeral); the backup webhook also posts a fresh full archive.
-A zip from another server can only be loaded by the bot owner.
+> The old `antinuke.zip` (Upload / Refresh buttons) is gone: the backup stays in the bot's own database (`AN_DB_PATH`).
+> On Railway keep the volume mounted so `antinuke.db` survives redeploys. You can delete the old `data/antinuke_files` folder.
