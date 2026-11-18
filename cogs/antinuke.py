@@ -30,6 +30,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
+from utils import dataload
 from utils import nukerestore as restore
 from utils.icons import icon
 from utils.nukestore import VOICE_TYPES, Store, build_snapshot, channel_data, digest_of, role_data, serialize_message
@@ -639,6 +640,27 @@ class AntiNuke(commands.Cog):
         counts = await asyncio.to_thread(self.store.counts, guild.id)
         return (f"{counts['channels']} channels, {counts['roles']} roles, {counts['messages']:,} messages saved "
                 f"({counts['snapshots']} structure versions).")
+
+    async def merge_backup(self, raw: bytes, name: str, replace: bool = False) -> list:
+        """Merge the anti-nuke part of an uploaded backup (webhook link, trusted users, saved structure...) into the
+        live database, then refresh what the running cog keeps in memory."""
+        def work() -> list:
+            with self.store.lock:
+                return dataload.merge_antinuke_file(self.store.conn, raw, name, replace=replace)
+
+        results = await asyncio.to_thread(work)
+        if results:
+            await self.after_import()
+        return results
+
+    async def after_import(self) -> None:
+        self.enabled = set(await asyncio.to_thread(self.store.enabled_guild_ids))
+        self.known.clear()
+        self.digest.clear()
+        for gid in list(self.enabled):
+            guild = self.bot.get_guild(gid)
+            if guild is not None:
+                self._spawn(self.backfill(guild))
 
     # ------------------------------------------------------------------ panel
     def panel_embed(self, guild: discord.Guild) -> discord.Embed:

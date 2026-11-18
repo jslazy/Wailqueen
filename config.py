@@ -71,6 +71,8 @@ BACKUP_WEBHOOK_URL = os.getenv("BACKUP_WEBHOOK_URL", "").strip()
 # "send" = a new message with the files each time, "edit" = keep one message and update it.
 BACKUP_WEBHOOK_MODE = os.getenv("BACKUP_WEBHOOK_MODE", "edit").strip().lower()
 BACKUP_WEBHOOK_INTERVAL = max(int(os.getenv("BACKUP_WEBHOOK_INTERVAL", "30")), 10)
+# 1 = if the bot starts with EMPTY data (wiped disk / new host), restore the newest backup from the backup channel.
+AUTO_RECOVER = os.getenv("AUTO_RECOVER", "1") == "1"
 
 # ---------------- Ticket system defaults (cogs/tickets.py) ----------------
 # Everything here is only the DEFAULT. Admins change it per server with !ticketedit / !ticketcategory.

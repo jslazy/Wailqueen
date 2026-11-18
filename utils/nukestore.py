@@ -68,8 +68,10 @@ class Store:
         self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self.lock = threading.RLock()
         with self.lock:
-            self.conn.execute("PRAGMA journal_mode=WAL")
-            self.conn.execute("PRAGMA synchronous=NORMAL")
+            # No -wal side file (same reason as bot.db): the settings (webhook link, trusted users...) are always
+            # fully inside antinuke.db, so a restart / a copied or replaced file can never lose or mix them.
+            self.conn.execute("PRAGMA journal_mode=DELETE")
+            self.conn.execute("PRAGMA synchronous=FULL")
             self.conn.executescript(SCHEMA)
             self.conn.commit()
 
@@ -318,6 +320,15 @@ class Store:
                 return mem.serialize()
             finally:
                 mem.close()
+
+    def export_config_json(self) -> bytes:
+        """Small readable file with every server's anti-nuke SETTINGS (webhook link, trusted users, punishment...)."""
+        with self.lock:
+            cur = self.conn.execute("SELECT * FROM an_config")
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        payload = {"exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tables": {"an_config": rows}}
+        return json.dumps(payload, indent=2, ensure_ascii=False, default=str).encode("utf-8")
 
     def export_guild_bytes(self, guild_id: int) -> bytes:
         """Copy of the backup database that contains ONLY this server's data (never another server's)."""

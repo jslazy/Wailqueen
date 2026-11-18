@@ -88,7 +88,7 @@ class WelcomeEditModal(discord.ui.Modal, title="Edit Welcome Message"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         assert interaction.guild_id is not None and isinstance(interaction.user, discord.Member)
-        await interaction.response.defer(ephemeral=True)  # downloading the banner can take a few seconds
+        await interaction.response.defer(ephemeral=True)  # keep the interaction alive
         changes = dict(
             content=self.content_in.value or "",
             title=self.title_in.value,
@@ -101,7 +101,7 @@ class WelcomeEditModal(discord.ui.Modal, title="Edit Welcome Message"):
             changes["banner"] = ""
         elif raw:
             try:
-                changes["banner"] = await images.store(self.cog.db, raw)  # saved permanently
+                changes["banner"] = await images.store(self.cog.db, raw)  # only the link is saved
             except images.ImageError as exc:
                 note = f"\n{icon('warn')} Banner not changed: {exc}"
         self.cog.save_cfg(interaction.guild_id, **changes)
@@ -296,16 +296,15 @@ class Welcome(commands.Cog):
                 f"Example: `{config.PREFIX}welcomebanner https://.../banner.png`",
                 ephemeral=True,
             )
-        async with ctx.typing():
-            try:
-                marker = await images.store(self.db, source)
-            except images.ImageError as exc:
-                return await ctx.send(f"{icon('warn')} {exc}", ephemeral=True)
+        try:
+            marker = await images.store(self.db, source)  # only the link is saved
+        except images.ImageError as exc:
+            return await ctx.send(f"{icon('warn')} {exc}", ephemeral=True)
         self.save_cfg(ctx.guild.id, banner=marker)
         if isinstance(ctx.author, discord.Member):
             content, embed, files = self.build_message(ctx.author)
             await ctx.send(content=content, embed=embed, files=files)
-        await ctx.send(f"{icon('ok')} Welcome banner saved permanently (preview above).")
+        await ctx.send(f"{icon('ok')} Welcome banner link saved (preview above).")
 
 
 async def setup(bot: commands.Bot) -> None:

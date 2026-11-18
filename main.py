@@ -120,7 +120,7 @@ class PremiumBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         try:  # data dropped into import/ (or a newer seed/ / data/ folder) is merged before anything reads it
-            for line in dataload.auto_import(self.db.conn, config.DB_PATH, config.BASE_DIR):
+            for line in dataload.auto_import(self.db.conn, config.DB_PATH, config.BASE_DIR, config.AN_DB_PATH):
                 log.info("Data import: %s", line)
         except Exception:
             log.exception("Automatic data import failed (the bot keeps its current data)")
@@ -175,6 +175,8 @@ def main() -> None:
     if not config.TOKEN:
         raise SystemExit("DISCORD_TOKEN is missing. Copy .env.example to .env and set it.")
     for note in dataload.prepare_database(config.DB_PATH, config.BASE_DIR / "seed" / "bot.db"):
+        print(f"[data] {note}")
+    for note in dataload.prepare_antinuke_database(config.AN_DB_PATH):
         print(f"[data] {note}")
     PremiumBot().run(config.TOKEN)
 

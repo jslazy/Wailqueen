@@ -67,9 +67,13 @@ class Backup(commands.Cog):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         self.push_webhook.change_interval(seconds=config.BACKUP_WEBHOOK_INTERVAL)
         self.push_webhook.start()
+        self._recovery = asyncio.get_running_loop().create_task(self.recover_from_webhook())
 
     async def cog_unload(self) -> None:
         self.push_webhook.cancel()
+        task = getattr(self, "_recovery", None)
+        if task is not None:
+            task.cancel()
         if self.session and not self.session.closed:
             await self.session.close()
 
@@ -107,10 +111,12 @@ class Backup(commands.Cog):
             color=0xE74C3C if shutdown else 0x2ECC71,
             timestamp=now,
         )
-        labels = ("\U0001F4C1 Data", "\U0001F4BB Code")
+        def label(n: str) -> str:
+            return ("\U0001F6E1\uFE0F Anti-nuke" if "-antinuke" in n else "\U0001F4BB Code" if "-code" in n else "\U0001F4C1 Data")
+
         embed.add_field(
             name="Files",
-            value="\n".join(f"{labels[i]}: `{n}` ({sizes[i] / 1024:.0f} KB)" for i, n in enumerate(names)) or "none",
+            value="\n".join(f"{label(n)}: `{n}` ({sizes[i] / 1024:.0f} KB)" for i, n in enumerate(names)) or "none",
             inline=False,
         )
         status = []
@@ -132,16 +138,26 @@ class Backup(commands.Cog):
             try:
                 webhook = discord.Webhook.from_url(url, session=self.session)
                 base = config.BOT_NAME.lower().replace(" ", "-")
-                data_bytes, _ = snap.data_zip(self.conn)
+                an_cog = self.bot.get_cog("AntiNuke")
+                an_store = an_cog.store if an_cog is not None else None  # type: ignore[attr-defined]
+                data_bytes, _ = snap.data_zip(self.conn, an_store)
                 code_bytes, _ = snap.source_zip()
+                files_in: list[tuple[str, bytes]] = [(f"{base}-data.zip", data_bytes), (f"{base}-code.zip", code_bytes)]
+                if an_store is not None:  # the full anti-nuke database (settings + saved structure + saved messages)
+                    an_bytes, _ = await asyncio.to_thread(snap.antinuke_zip, an_store)
+                    files_in.append((f"{base}-antinuke.zip", an_bytes))
                 notes: list[str] = []
                 payload: list[tuple[str, bytes]] = []
-                for label, name, raw in (("data", f"{base}-data.zip", data_bytes), ("code", f"{base}-code.zip", code_bytes)):
-                    fitted = snap.fit(name, raw, WEBHOOK_LIMIT)
+                budget = WEBHOOK_LIMIT
+                for name, raw in files_in:
+                    fitted = snap.fit(name, raw, budget)
                     if fitted is None:
                         notes.append(f"{name} is too large to upload ({len(raw) / 1048576:.1f} MB)")
                     else:
                         payload.append(fitted)
+                        budget -= len(fitted[1])  # one message may hold ~10 MB in total
+                if an_store is not None and not any(n.endswith("-data.zip") for n, _ in payload):
+                    notes.append("data zip missing: anti-nuke settings are NOT in this backup")
                 embed = self._report(reason, [p[0] for p in payload], [len(p[1]) for p in payload], notes)
 
                 def files() -> list[discord.File]:
@@ -214,12 +230,29 @@ class Backup(commands.Cog):
         for att in attachments.values():
             try:
                 raw = await att.read()
+            except discord.HTTPException:
+                failed.append(f"`{att.filename}`: could not be downloaded")
+                continue
+            results: list = []
+            bot_error: Optional[Exception] = None
+            try:
                 results = dataload.merge_file(self.conn, config.DB_PATH, raw, att.filename, replace=replace)
             except Exception as exc:
-                failed.append(f"`{att.filename}`: {exc if isinstance(exc, ValueError) else type(exc).__name__}")
-                log.exception("backupload failed for %s", att.filename)
+                bot_error = exc
+                if not isinstance(exc, ValueError):
+                    log.exception("backupload failed for %s", att.filename)
+            an_results: list = []
+            an_cog = self.bot.get_cog("AntiNuke")
+            if an_cog is not None:  # webhook link, trusted users, saved structure... of the anti-nuke system
+                try:
+                    an_results = await an_cog.merge_backup(raw, att.filename, replace=replace)  # type: ignore[attr-defined]
+                except Exception as exc:
+                    failed.append(f"`{att.filename}` (anti-nuke): {type(exc).__name__}")
+                    log.exception("anti-nuke backupload failed for %s", att.filename)
+            if bot_error is not None and not an_results and not (isinstance(bot_error, ValueError) and failed):
+                failed.append(f"`{att.filename}`: {bot_error if isinstance(bot_error, ValueError) else type(bot_error).__name__}")
                 continue
-            for table, c in dataload.totals(results).items():
+            for table, c in {**dataload.totals(results), **dataload.totals(an_results)}.items():
                 grand["added"] += c["added"]
                 grand["skipped"] += c["skipped"]
                 if c["added"] or c["skipped"]:
@@ -249,6 +282,60 @@ class Backup(commands.Cog):
                     log.exception("Could not reload %s", ext)
         return done
 
+    # ------------------------------------------------------------- automatic recovery
+    def _is_fresh(self) -> bool:
+        """True when the bot starts with completely empty data (a wiped disk / new host): nothing to lose by restoring."""
+        counts = snap.table_counts(self.conn)
+        rows = sum(n for t, n in counts.items() if t != "data_imports")
+        an_rows = dataload.antinuke_row_count(config.AN_DB_PATH)
+        return rows == 0 and an_rows == 0
+
+    async def recover_from_webhook(self) -> None:
+        """If the bot starts with EMPTY data (the host wiped the disk), take the newest backup from the backup webhook's
+        channel and merge it back: all settings, the anti-nuke webhook link, tickets, giveaways... Best effort and only
+        ever ADDS data. Needs either the saved message id or Read Message History in the backup channel."""
+        await self.bot.wait_until_ready()
+        if not config.AUTO_RECOVER or not config.BACKUP_WEBHOOK_URL or self.session is None or not self._is_fresh():
+            return
+        base = config.BOT_NAME.lower().replace(" ", "-")
+        try:
+            webhook = discord.Webhook.from_url(config.BACKUP_WEBHOOK_URL, session=self.session)
+            message: Optional[discord.WebhookMessage] = None
+            if self.state.get("webhook_message_id"):
+                try:
+                    message = await webhook.fetch_message(self.state["webhook_message_id"])
+                except discord.HTTPException:
+                    message = None
+            if message is None:
+                info = await webhook.fetch()
+                channel = self.bot.get_channel(info.channel_id) if info.channel_id else None
+                if channel is None and info.channel_id:
+                    channel = await self.bot.fetch_channel(info.channel_id)
+                async for m in channel.history(limit=100):  # type: ignore[union-attr]
+                    if m.webhook_id == info.id and any(a.filename.startswith(base) and "-data.zip" in a.filename for a in m.attachments):
+                        message = m  # type: ignore[assignment]
+                        break
+            if message is None:
+                log.info("Automatic recovery: no backup message found")
+                return
+            wanted = [a for a in message.attachments if a.filename.startswith(base) and ("-data.zip" in a.filename or "-antinuke.zip" in a.filename)]
+            added = 0
+            for att in wanted:
+                raw = await att.read()
+                try:
+                    added += sum(c["added"] for c in dataload.totals(dataload.merge_file(self.conn, config.DB_PATH, raw, att.filename)).values())
+                except ValueError:
+                    pass
+                an_cog = self.bot.get_cog("AntiNuke")
+                if an_cog is not None:
+                    results = await an_cog.merge_backup(raw, att.filename)  # type: ignore[attr-defined]
+                    added += sum(c["added"] for c in dataload.totals(results).values())
+            if added:
+                await self._reload_data_cogs()
+            log.warning("Automatic recovery: data folder was empty, %d rows restored from the backup channel", added)
+        except Exception as exc:
+            log.warning("Automatic recovery skipped: %s", type(exc).__name__)
+
     @tasks.loop(seconds=60)
     async def push_webhook(self) -> None:
         await self._push("scheduled")
@@ -256,6 +343,12 @@ class Backup(commands.Cog):
     @push_webhook.before_loop
     async def _before_push(self) -> None:
         await self.bot.wait_until_ready()
+        task = getattr(self, "_recovery", None)
+        if task is not None:  # an empty database must never overwrite the good backup before it was restored
+            try:
+                await asyncio.wait_for(asyncio.shield(task), 60)
+            except Exception:
+                pass
 
 
 async def setup(bot: commands.Bot) -> None:

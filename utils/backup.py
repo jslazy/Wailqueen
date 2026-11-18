@@ -26,11 +26,17 @@ def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
     return {t: conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0] for t in tables}
 
 
+# tables that only hold old image FILES (new banners are saved as links inside the settings): not put in the JSON
+JSON_SKIP = {"images"}
+
+
 def export_json(conn: sqlite3.Connection) -> bytes:
     """Every table as readable JSON (rows as objects)."""
     cursor = conn.cursor()
     data: dict[str, list] = {}
     for table in table_counts(conn):
+        if table in JSON_SKIP:
+            continue
         cursor.execute(f'SELECT * FROM "{table}"')
         cols = [d[0] for d in cursor.description]
         data[table] = [dict(zip(cols, row)) for row in cursor.fetchall()]
@@ -75,10 +81,24 @@ def source_zip() -> tuple[bytes, int]:
     return buf.getvalue(), len(files)
 
 
-def data_zip(conn: sqlite3.Connection) -> tuple[bytes, int]:
-    """ZIP 2: only the bot DATA: a fresh copy of data/bot.db and data/bot-data.json (no code, no .env)."""
+def data_zip(conn: sqlite3.Connection, an_store=None) -> tuple[bytes, int]:
+    """ZIP 2: only the bot DATA: a fresh copy of data/bot.db and data/bot-data.json (no code, no .env).
+    With `an_store` it also holds data/antinuke-config.json: the anti-nuke SETTINGS (webhook link, trusted
+    users, punishment, on/off...) of every server. It is tiny, so it is always inside this zip."""
     buf = io.BytesIO()
+    n = 2
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         zf.writestr("data/bot.db", snapshot_db(conn))
         zf.writestr("data/bot-data.json", export_json(conn))
-    return buf.getvalue(), 2
+        if an_store is not None:
+            zf.writestr("data/antinuke-config.json", an_store.export_config_json())
+            n += 1
+    return buf.getvalue(), n
+
+
+def antinuke_zip(an_store) -> tuple[bytes, int]:
+    """ZIP 3: the FULL anti-nuke database (settings + saved structure + saved messages)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        zf.writestr("data/antinuke.db", an_store.export_bytes())
+    return buf.getvalue(), 1

@@ -393,7 +393,7 @@ class Editor(discord.ui.View):
         await self._image(interaction, "thumbnail")
 
     async def _image(self, interaction: discord.Interaction, key: str) -> None:
-        """Wait for an uploaded image or a link in the channel. Saved permanently in the database."""
+        """Wait for an uploaded image or a link in the channel. Only the link is saved."""
         await interaction.response.send_message(
             f"{icon('image')} Send the **{key}** image in this channel within 60 seconds: **upload it** or **paste a direct link**.\n"
             f"Type `remove` to delete the current {key}.",

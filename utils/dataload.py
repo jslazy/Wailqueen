@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 from utils.db import SCHEMA
+from utils.nukestore import SCHEMA as AN_SCHEMA
 
 log = logging.getLogger("premium-bot.dataload")
 
@@ -138,12 +139,12 @@ def prepare_database(db_path: str, seed: Optional[Path] = None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------- reading backups
-def _json_to_db(raw: bytes, out: Path) -> Path:
+def _json_to_db(raw: bytes, out: Path, schema: str = SCHEMA) -> Path:
     payload = json.loads(raw.decode("utf-8"))
     tables = payload.get("tables", payload)
     conn = sqlite3.connect(out)
     try:
-        conn.executescript(SCHEMA)
+        conn.executescript(schema)
         for table, rows in tables.items():
             if not isinstance(rows, list) or not rows:
                 continue
@@ -328,20 +329,224 @@ def totals(results: list[tuple[str, dict]]) -> dict[str, dict[str, int]]:
     return out
 
 
+# ---------------------------------------------------------------------------- anti-nuke data
+AN_TABLES = ("an_config", "an_objects", "an_snapshots", "an_messages", "an_events", "an_cooldowns")
+
+
+def _is_antinuke_db(path: Path) -> bool:
+    try:
+        c = sqlite3.connect(path)
+        try:
+            return bool(c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='an_config'").fetchone())
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return False
+
+
+def extract_antinuke_sources(raw: bytes, name: str, tmp: Path, depth: int = 0) -> list[tuple[str, Path]]:
+    """Every anti-nuke database inside an uploaded file: antinuke.db, antinuke-config.json, .gz or a .zip holding them."""
+    if depth > 3 or len(raw) > MAX_BYTES:
+        return []
+    n = len(list(tmp.iterdir()))
+    if raw.startswith(SQLITE_MAGIC):
+        p = tmp / f"an{n}.db"
+        p.write_bytes(raw)
+        return [(name, p)] if _is_antinuke_db(p) else []
+    if raw[:2] == b"\x1f\x8b":
+        return extract_antinuke_sources(gzip.decompress(raw), name.removesuffix(".gz"), tmp, depth + 1)
+    if raw[:4] == b"PK\x03\x04":
+        found: list[tuple[str, Path]] = []
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            infos = [i for i in zf.infolist() if not i.is_dir()]
+            if sum(i.file_size for i in infos) > MAX_BYTES:
+                raise ValueError("zip is too large")
+            full = [i for i in infos if "antinuke" in i.filename.lower() and not i.filename.lower().endswith(("-wal", "-shm", ".json"))]
+            small = [i for i in infos if "antinuke" in i.filename.lower() and i.filename.lower().endswith(".json")]
+            for i in full:
+                found += extract_antinuke_sources(zf.read(i), f"{name}:{i.filename}", tmp, depth + 1)
+            for i in small:  # the settings file is always merged too (the full db may be older / missing)
+                found += extract_antinuke_sources(zf.read(i), f"{name}:{i.filename}", tmp, depth + 1)
+        return found
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        if "an_config" not in payload.get("tables", payload):
+            return []  # a normal bot-data.json, nothing for anti-nuke inside
+        return [(name, _json_to_db(raw, tmp / f"an{n}.db", AN_SCHEMA))]
+    except (ValueError, UnicodeDecodeError, sqlite3.Error, AttributeError):
+        return []
+
+
+_AN_DEFAULTS = {"enabled": 0, "webhook_url": "", "punishment": "ban", "auto_restore": 1, "trusted": "", "webhook_msg_id": 0}
+
+
+def _merge_an_config(conn: sqlite3.Connection, replace: bool) -> dict[str, int]:
+    """Settings per server. The webhook link / trusted users of the backup are never lost:
+    * server not known yet                          -> the backup row is added
+    * server only has the untouched default row     -> the backup row replaces it
+    * server already configured                     -> empty fields (webhook link, trusted users) are filled from the backup
+    * replace=True                                  -> the backup row wins completely"""
+    have = _cols(conn, "main", "an_config")
+    cols = [c for c in _cols(conn, "src", "an_config") if c in have]
+    if "guild_id" not in cols:
+        return {"added": 0, "skipped": 0}
+    added = skipped = 0
+    for row in conn.execute(f'SELECT {",".join(cols)} FROM src.an_config').fetchall():
+        src = dict(zip(cols, row))
+        cur = conn.execute(f'SELECT {",".join(have)} FROM main.an_config WHERE guild_id=?', (src["guild_id"],)).fetchone()
+        if cur is None:
+            conn.execute(f'INSERT INTO main.an_config ({",".join(cols)}) VALUES ({",".join("?" * len(cols))})', [src[c] for c in cols])
+            added += 1
+            continue
+        mine = dict(zip(have, cur))
+        pristine = all(mine.get(k, v) == v for k, v in _AN_DEFAULTS.items())
+        if replace or pristine:
+            sets = ", ".join(f"{c}=?" for c in cols if c != "guild_id")
+            if sets:
+                conn.execute(f"UPDATE main.an_config SET {sets} WHERE guild_id=?",
+                             [src[c] for c in cols if c != "guild_id"] + [src["guild_id"]])
+            added += 1
+            continue
+        fill: dict[str, object] = {}
+        if not mine.get("webhook_url") and src.get("webhook_url"):
+            fill["webhook_url"] = src["webhook_url"]
+            if "webhook_msg_id" in cols:
+                fill["webhook_msg_id"] = src.get("webhook_msg_id") or 0
+        if src.get("trusted"):
+            union = [x for x in dict.fromkeys(filter(None, (mine.get("trusted") or "").split(",") + src["trusted"].split(","))) if x.strip()]
+            if ",".join(union) != (mine.get("trusted") or ""):
+                fill["trusted"] = ",".join(union)
+        if fill:
+            conn.execute(f"UPDATE main.an_config SET {', '.join(f'{k}=?' for k in fill)} WHERE guild_id=?",
+                         [*fill.values(), src["guild_id"]])
+            added += 1
+        else:
+            skipped += 1
+    return {"added": added, "skipped": skipped}
+
+
+def merge_antinuke_src(conn: sqlite3.Connection, replace: bool = False) -> dict[str, dict[str, int]]:
+    """`src` (an anti-nuke database) is attached to `conn` (the live anti-nuke database)."""
+    src_tables = {r[0] for r in conn.execute("SELECT name FROM src.sqlite_master WHERE type='table'")}
+    report: dict[str, dict[str, int]] = {}
+    if "an_config" in src_tables:
+        report["an_config"] = _merge_an_config(conn, replace)
+    # (table, columns that identify a row besides its auto id)
+    plain = {"an_objects": None, "an_messages": None, "an_cooldowns": None}
+    for table in plain:
+        if table not in src_tables:
+            continue
+        cols = [c for c in _cols(conn, "src", table) if c in _cols(conn, "main", table)]
+        total = conn.execute(f'SELECT COUNT(*) FROM src."{table}"').fetchone()[0]
+        before = conn.total_changes
+        conn.execute(f'INSERT OR IGNORE INTO main."{table}" ({",".join(cols)}) SELECT {",".join(cols)} FROM src."{table}"')
+        added = conn.total_changes - before
+        report[table] = {"added": added, "skipped": total - added}
+    for table, key in (("an_snapshots", "guild_id, hash"), ("an_events", "guild_id, ts, type, details")):
+        if table not in src_tables:
+            continue
+        cols = [c for c in _cols(conn, "src", table) if c in _cols(conn, "main", table) and c != "id"]
+        total = conn.execute(f'SELECT COUNT(*) FROM src."{table}"').fetchone()[0]
+        before = conn.total_changes
+        match = " AND ".join(f'm."{k.strip()}" IS s."{k.strip()}"' for k in key.split(","))
+        conn.execute(f'INSERT INTO main."{table}" ({",".join(cols)}) SELECT {",".join("s." + c for c in cols)} '
+                     f'FROM src."{table}" s WHERE NOT EXISTS (SELECT 1 FROM main."{table}" m WHERE {match}) ORDER BY s.id')
+        added = conn.total_changes - before
+        report[table] = {"added": added, "skipped": total - added}
+    return report
+
+
+def merge_antinuke_file(conn: sqlite3.Connection, raw: bytes, name: str, *, replace: bool = False
+                        ) -> list[tuple[str, dict[str, dict[str, int]]]]:
+    """Merge the anti-nuke part of an uploaded backup into the live anti-nuke database `conn`.
+    Returns [] when the file holds no anti-nuke data (that is fine, e.g. an old backup)."""
+    results: list[tuple[str, dict]] = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sources = extract_antinuke_sources(raw, name, Path(tmpdir))
+        # the full database first, the small settings file last (so its link / trusted users always end up filled in)
+        sources.sort(key=lambda s: s[0].lower().endswith(".json"))
+        for src_name, path in sources:
+            conn.commit()
+            conn.execute("ATTACH DATABASE ? AS src", (str(path),))
+            try:
+                rep = merge_antinuke_src(conn, replace)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.commit()
+                conn.execute("DETACH DATABASE src")
+            results.append((src_name, rep))
+    return results
+
+
+def prepare_antinuke_database(db_path: str) -> list[str]:
+    """Like prepare_database(), for antinuke.db: a leftover -wal file (old versions used WAL) is folded in on a
+    COPY and then removed, so a restart never loses the settings and a replaced antinuke.db is never mixed up."""
+    notes: list[str] = []
+    db = Path(db_path)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    wal, shm = db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")
+    if db.exists() and db.stat().st_size > 0:
+        if wal.exists() and wal.stat().st_size > 0:
+            folded = _with_wal(db, wal)
+            _aside(wal, "stale")
+            if folded is not None:
+                db.write_bytes(folded)
+                notes.append("antinuke.db: unsaved changes from the old -wal file were folded back in")
+            else:
+                notes.append("antinuke.db: an old -wal file did not match and was moved to data/stale/")
+        if not _healthy(db, None):
+            _aside(db, "corrupt")
+            notes.append("antinuke.db was damaged and was moved to data/corrupt/")
+    elif db.exists():
+        db.unlink()
+    for side in (wal, shm):
+        side.unlink(missing_ok=True)
+    return notes
+
+
+def antinuke_row_count(db_path: str) -> int:
+    """How many server settings rows antinuke.db has (0 for a missing / brand new file)."""
+    try:
+        c = sqlite3.connect(db_path, timeout=30)
+        try:
+            return c.execute("SELECT COUNT(*) FROM an_config").fetchone()[0]
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return 0
+
+
 # ---------------------------------------------------------------------------- start-up auto import
-def auto_import(conn: sqlite3.Connection, db_path: str, root: Path) -> list[str]:
+def _auto_antinuke(an_path: str, raw: bytes, name: str) -> int:
+    """Merge the anti-nuke part of a start-up file into antinuke.db (opened briefly, before the bot uses it)."""
+    conn = sqlite3.connect(an_path, timeout=30)
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.executescript(AN_SCHEMA)
+        results = merge_antinuke_file(conn, raw, name)
+        return sum(c["added"] for c in totals(results).values())
+    finally:
+        conn.commit()
+        conn.close()
+
+
+def auto_import(conn: sqlite3.Connection, db_path: str, root: Path, an_path: Optional[str] = None) -> list[str]:
     """Merge files from import/ (moved to import/done/ afterwards) and newer seed/ or data/ folders.
+    Both the bot data and (when `an_path` is given) the anti-nuke data inside a file are merged.
     A file is only merged once (its hash is remembered inside the database)."""
     lines: list[str] = []
-    live = Path(db_path).resolve()
+    live = {Path(db_path).resolve()} | ({Path(an_path).resolve()} if an_path else set())
     candidates: list[tuple[Path, bool]] = []
     for folder, move in ((root / "import", True), (Path(db_path).parent / "import", True)):
         if folder.is_dir():
             candidates += [(p, move) for p in sorted(folder.rglob("*")) if p.is_file() and "done" not in p.parts]
     for folder in (root / "seed", root / "data"):
-        for pattern in ("bot.db", "bot-data.json"):
+        for pattern in ("bot.db", "bot-data.json", "antinuke.db", "antinuke-config.json"):
             p = folder / pattern
-            if p.is_file() and p.resolve() != live:
+            if p.is_file() and p.resolve() not in live:
                 candidates.append((p, False))
     seen: set[str] = set()
     for path, move in candidates:
@@ -356,18 +561,39 @@ def auto_import(conn: sqlite3.Connection, db_path: str, root: Path) -> list[str]
         if conn.execute("SELECT 1 FROM data_imports WHERE hash=?", (digest,)).fetchone():
             _finish(path, move)
             continue
+        added, found, error = 0, False, None
         try:
-            results = merge_file(conn, db_path, raw, path.name)
+            added += sum(c["added"] for c in totals(merge_file(conn, db_path, raw, path.name)).values())
+            found = True
+        except ValueError:
+            pass  # no bot data inside (e.g. only anti-nuke data); handled below
         except Exception as exc:
-            lines.append(f"{path.name}: skipped ({type(exc).__name__}: {exc})")
+            error = exc
+        if an_path and error is None:
+            try:
+                an_added = _auto_antinuke(an_path, raw, path.name)
+                added += an_added
+                found = found or an_added > 0 or bool(extract_antinuke_probe(raw, path.name))
+            except Exception as exc:
+                error = exc
+        if error is not None or not found:
+            lines.append(f"{path.name}: skipped ({type(error).__name__ + ': ' + str(error) if error else 'no usable data inside'})")
             continue
         conn.execute("INSERT OR IGNORE INTO data_imports (hash, name, imported_at) VALUES (?,?,?)",
                      (digest, path.name, datetime.now(timezone.utc).isoformat()))
         conn.commit()
-        added = sum(c["added"] for c in totals(results).values())
         lines.append(f"{path.name}: {added} new rows added")
         _finish(path, move)
     return lines
+
+
+def extract_antinuke_probe(raw: bytes, name: str) -> bool:
+    """True if the file holds any anti-nuke database / settings file (even when everything in it already exists)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            return bool(extract_antinuke_sources(raw, name, Path(tmpdir)))
+        except Exception:
+            return False
 
 
 def _finish(path: Path, move: bool) -> None:
