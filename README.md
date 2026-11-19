@@ -1,6 +1,6 @@
 # WailQueen
 
-Information, moderation and welcome bot for discord.py 2.6+. Prefix and slash commands.
+Information and welcome bot for discord.py 2.6+. Prefix and slash commands.
 
 ## Commands
 
@@ -15,26 +15,6 @@ Information, moderation and welcome bot for discord.py 2.6+. Prefix and slash co
 | banner [user] | bn | Profile banner |
 | ping | | Latency and uptime |
 
-### Moderation (needs the matching permission)
-Add the reason with `?r`: `!warn @member ?r spamming`, `!timeout @member 10m ?r spam`, `!ban @user ?r reason`.
-Slash commands use the normal `reason` option.
-
-| Command | Permission | Description |
-|---|---|---|
-| warn <member> [?r reason] | Timeout Members | Warn a member (saved per server) |
-| warnings <member> | Timeout Members | Last 10 warnings of a member |
-| warnlist (wl) [member] | Timeout Members | Full warn list of the server, with pages |
-| delwarn <id> [?r reason] | Timeout Members | Delete one warning |
-| clearwarns <member> [?r reason] | Timeout Members | Clear all warnings of a member |
-| timeout <member> <10m/2h/1d> [?r reason] (alias mute) | Timeout Members | Timeout, max 28 days |
-| untimeout <member> [?r reason] (alias unmute) | Timeout Members | Remove a timeout |
-| timeoutlist (tl) | Timeout Members | Members timed out right now |
-| kick <member> [?r reason] | Kick Members | Kick a member |
-| kicklist (kl) | Kick Members | Kick history |
-| ban <user/ID> [?r reason] | Ban Members | Ban a member or any user ID |
-| unban <user ID> [?r reason] | Ban Members | Unban |
-| banlist (bl) | Ban Members | Everyone banned right now |
-
 ### Webhook backup (automatic, no command)
 Set `BACKUP_WEBHOOK_URL` in `.env` and every minute (`BACKUP_WEBHOOK_INTERVAL`) the webhook gets ONE zip with the whole bot
 (all source files + a fresh `data/bot.db` snapshot and `data/bot-data.json`) and a detailed report embed (status, uptime,
@@ -42,21 +22,16 @@ latency, servers, users, database rows, zip size and hash, versions). One more b
 `.env` is never included. `BACKUP_WEBHOOK_MODE=send` posts a new message each time, `edit` keeps updating one message.
 The database is only read, never changed. The webhook receives ALL bot data, so keep it private.
 
-### Moderation logs (Manage Server)
-`logchannel #channel` sends every warn, timeout, kick and ban (and removals) to that channel.
-`logoff` turns it off. Bans, kicks and timeouts done by hand in Discord are logged too
-(the bot needs View Audit Log).
-
 ### Custom aliases (Administrator)
-`alias add <command> <name>` gives a command a short name in your server, e.g. `alias add warn w`,
-then `!w @member ?r reason` works. `alias remove <name>`, `alias list`. Permissions of the real
+`alias add <command> <name>` gives a command a short name in your server, e.g. `alias add ping p`,
+then `!p` works. `alias remove <name>`, `alias list`. Permissions of the real
 command still apply.
 
 ### No prefix (bot owner only)
 `noprefix add <user>` lets that user run commands without the prefix (`ping` instead of `!ping`). `noprefix remove <user>`, `noprefix list` (alias `np`). Slash: `/noprefix add|remove|list`. Saved in `data/bot.db`.
 
 ### Welcome setup (slash only, needs Manage Server, hidden from normal members)
-`/welcome-setup`, `/welcome-edit` (text, color and banner link), `/welcome-test`, `/welcome-toggle`, `/welcome-reset`
+`/welcome-setup`, `/welcome-edit` (text and color, with an Upload banner button), `/welcome-test`, `/welcome-toggle`, `/welcome-reset`
 
 Normal members never see these in the slash menu or in `help`. Administrators see everything.
 
@@ -67,7 +42,7 @@ All setup commands need **Manage Server**. The bot needs **Manage Channels** (an
 | Command | Description |
 |---|---|
 | ticketset [#channel] | Sends the ticket panel (Components V2, default text from `config.py`) and remembers the channel |
-| ticketedit | Edit panel text/banner/color, ticket message, **support roles**, **admin roles**, tickets per member, resend panel |
+| ticketedit | Edit panel text/color, **Upload banner** button, ticket message, **support roles**, **admin roles**, tickets per member, resend panel |
 | ticketcategory | List categories. `create <name>`, `edit <name>`, `delete <name>` (edit lets you pick the Discord channel category tickets are created in) |
 | ticketlogs [#channel] | Pick the 3 log channels: ticket opened, ticket closed, ticket transcript (or one channel for all) |
 
@@ -145,7 +120,8 @@ Panel buttons: **Enable/Disable protection**, **Set webhook** (paste the webhook
 * bot.db no longer uses `-wal` files, so replacing `data/bot.db` can no longer corrupt or reset it. A leftover `-wal` file is moved to `data/stale/` and its rows are merged back automatically.
 * **Backup now holds everything**: `-data.zip` = `bot.db` + `bot-data.json` + `antinuke-config.json` (anti-nuke webhook link, trusted users, punishment...), `-antinuke.zip` = the full anti-nuke database, `-code.zip` = the code. `!backupload` merges all of it (bot data AND anti-nuke data); the same applies to files in `import/` and `seed/`.
 * **Automatic recovery** (`AUTO_RECOVER=1`, default): if the bot starts with completely EMPTY data (host wiped the disk), it takes the newest backup from the backup webhook's channel and merges it back. Needs Read Message History for the bot in that channel (or `data/backup_state.json` surviving). It only adds data and runs before the first new backup is sent.
-* **Images are saved as links only.** Ticket panel banner, welcome banner and giveaway banner / thumbnail store just the link inside the settings (nothing is downloaded). Old banners that were stored as files still work. Use a permanent link (Discord attachment links expire after a while).
+* **Images go through the owner's image host.** The bot owner sets one channel with `!imgchannel #channel` (any server). Every banner / thumbnail uploaded with the **Upload** buttons (ticket panel, giveaway, welcome) is re-posted there; pasting links is no longer possible. Only a reference (`host:<channel>:<message>`) and the link are saved in `bot.db`, so backups hold links, never images. Discord image links expire, so the bot reads the links again from the host messages every 2 hours. Never delete messages in the host channel.
+* **Owner commands:** `!imgchannel [#channel|off]`, `!tolink` (attach an image or reply to one: uploads it and gives the link), `!linklist` (all saved links, with pages). Hidden from everyone except the bot owner.
 * Relative paths (`data/...`) are now relative to the bot folder, not to the folder the host starts the bot from.
 
 

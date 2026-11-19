@@ -25,7 +25,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
-from utils import images
+from utils import images, imagehost
 from utils.helpers import humanize_seconds, parse_duration
 from utils.icons import icon
 
@@ -384,48 +384,22 @@ class Editor(discord.ui.View):
 
         await interaction.response.send_modal(TextModal("Embed colour", inputs, done))
 
-    @discord.ui.button(label="Banner", emoji=icon("banner"), style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="Upload banner", emoji=icon("banner"), style=discord.ButtonStyle.primary, row=0)
     async def banner(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._image(interaction, "banner")
 
-    @discord.ui.button(label="Thumbnail", emoji=icon("image"), style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="Upload thumbnail", emoji=icon("image"), style=discord.ButtonStyle.primary, row=0)
     async def thumbnail(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._image(interaction, "thumbnail")
 
     async def _image(self, interaction: discord.Interaction, key: str) -> None:
-        """Wait for an uploaded image or a link in the channel. Only the link is saved."""
-        await interaction.response.send_message(
-            f"{icon('image')} Send the **{key}** image in this channel within 60 seconds: **upload it** or **paste a direct link**.\n"
-            f"Type `remove` to delete the current {key}.",
-            ephemeral=True,
-        )
-
-        def check(m: discord.Message) -> bool:
-            return m.author.id == self.author.id and m.channel.id == interaction.channel_id
-
-        try:
-            msg = await self.cog.bot.wait_for("message", check=check, timeout=60)
-        except asyncio.TimeoutError:
-            return await interaction.followup.send(f"{icon('hourglass')} Timed out, nothing changed.", ephemeral=True)
-
-        text = msg.content.strip()
-        source = msg.attachments[0].url if msg.attachments else text.split()[0] if text else ""
-        try:
-            if text.lower() == "remove" and not msg.attachments:
-                self.data[key] = ""
-            elif source:
-                self.data[key] = await images.store(self.cog.db, source)
-            else:
-                return await interaction.followup.send(f"{icon('warn')} No image found. Nothing changed.", ephemeral=True)
-        except images.ImageError as exc:
-            return await interaction.followup.send(f"{icon('warn')} {exc}", ephemeral=True)
-        finally:
-            try:
-                await msg.delete()  # keep the channel clean (needs Manage Messages, optional)
-            except discord.HTTPException:
-                pass
+        """Upload only: the image goes to the owner's image host and only its link is saved."""
+        marker = await imagehost.ask_image(interaction, self.cog.bot, author_id=self.author.id, what=key)
+        if marker is None:
+            return
+        self.data[key] = marker
         await self.refresh_message()
-        await interaction.followup.send(f"{icon('ok')} {key.title()} saved.", ephemeral=True)
+        await interaction.followup.send(f"{icon('ok')} {key.title()} {'saved' if marker else 'removed'}.", ephemeral=True)
 
     # ---------------------------------------------------------------- row 1
     @discord.ui.button(label="Button & emojis", emoji=icon("puzzle"), style=discord.ButtonStyle.secondary, row=1)

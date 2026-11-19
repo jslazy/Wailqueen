@@ -23,6 +23,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
+from utils import images, imagehost
 from utils import transcript as tscript
 from utils.icons import icon
 from utils.ui import make_embed
@@ -209,10 +210,6 @@ class PanelEditModal(discord.ui.Modal, title="Edit ticket panel"):
             label="Panel text (markdown works)", style=discord.TextStyle.paragraph,
             default=(cfg["panel_text"] or config.TICKET_PANEL_TEXT)[:3500], max_length=3500,
         )
-        self.banner_in = discord.ui.TextInput(
-            label="Banner image link (optional)", placeholder="https://... (empty = no banner)",
-            default=cfg["panel_banner"] or "", required=False, max_length=500,
-        )
         self.color_in = discord.ui.TextInput(
             label="Color (#HEX)", placeholder="#2ECC71",
             default=cfg["panel_color"] or "", required=False, max_length=7,
@@ -221,16 +218,11 @@ class PanelEditModal(discord.ui.Modal, title="Edit ticket panel"):
             label="Dropdown placeholder", default=cfg["panel_placeholder"] or config.TICKET_PANEL_PLACEHOLDER,
             required=False, max_length=100,
         )
-        for item in (self.text_in, self.banner_in, self.color_in, self.placeholder_in):
+        for item in (self.text_in, self.color_in, self.placeholder_in):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        banner = (self.banner_in.value or "").strip()
         color = (self.color_in.value or "").strip()
-        if banner and not banner.lower().startswith(("http://", "https://")):
-            return await interaction.response.send_message(
-                f"{icon('warn')} The banner must be a direct image link (http/https). Nothing was saved.", ephemeral=True
-            )
         if color and not HEX_COLOR.match(color):
             return await interaction.response.send_message(
                 f"{icon('warn')} Color must look like `#2ECC71`. Nothing was saved.", ephemeral=True
@@ -239,7 +231,6 @@ class PanelEditModal(discord.ui.Modal, title="Edit ticket panel"):
         self.cog.save_cfg(
             self.guild.id,
             panel_text=self.text_in.value.strip() or None,
-            panel_banner=banner or None,
             panel_color=color or None,
             panel_placeholder=(self.placeholder_in.value or "").strip() or None,
         )
@@ -391,6 +382,17 @@ class TicketEditView(OwnedView):
     @discord.ui.button(label="Panel message", emoji=icon("clipboard"), style=discord.ButtonStyle.primary, row=0)
     async def edit_panel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_modal(PanelEditModal(self.cog, self.guild, self.author_id))
+
+    @discord.ui.button(label="Upload banner", emoji=icon("banner"), style=discord.ButtonStyle.primary, row=0)
+    async def upload_banner(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        marker = await imagehost.ask_image(interaction, self.cog.bot, author_id=self.author_id, what="panel banner")
+        if marker is None:
+            return
+        self.cog.save_cfg(self.guild.id, panel_banner=marker or None)
+        await self.cog.refresh_panel(self.guild)
+        await interaction.followup.send(
+            f"{icon('ok')} Panel banner {'saved' if marker else 'removed'} and the panel was updated.", ephemeral=True
+        )
 
     @discord.ui.button(label="Ticket message", emoji=icon("ticket"), style=discord.ButtonStyle.primary, row=0)
     async def edit_welcome(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -685,8 +687,9 @@ class Tickets(commands.Cog):
         text = (cfg["panel_text"] or config.TICKET_PANEL_TEXT).replace("{server}", guild.name)[:3500]
         color = parse_color(cfg["panel_color"], config.TICKET_COLOR)
         parts: list[discord.ui.Item] = [discord.ui.TextDisplay(text)]
-        if cfg["panel_banner"]:
-            parts.append(discord.ui.MediaGallery(discord.MediaGalleryItem(cfg["panel_banner"])))
+        banner_url = images.resolve(self.db, cfg["panel_banner"])
+        if banner_url:
+            parts.append(discord.ui.MediaGallery(discord.MediaGalleryItem(banner_url)))
         parts.append(discord.ui.TextDisplay(f"-# Powered by {config.BOT_NAME}"))
         options = [
             discord.SelectOption(label=(c["label"] or c["name"])[:100], value=str(c["id"]), emoji=c["emoji"] or None)

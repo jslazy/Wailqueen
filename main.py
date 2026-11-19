@@ -20,7 +20,6 @@ log = logging.getLogger("premium-bot")
 
 EXTENSIONS = (
     "cogs.information",
-    "cogs.moderation",
     "cogs.welcome",
     "cogs.tickets",
     "cogs.giveaway",
@@ -28,6 +27,7 @@ EXTENSIONS = (
     "cogs.aliases",
     "cogs.noprefix",
     "cogs.backup",
+    "cogs.imagehost",
     "cogs.antinuke",
     "cogs.badges",
     "cogs.help",

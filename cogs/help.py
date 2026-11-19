@@ -12,13 +12,13 @@ from utils.icons import icon
 from utils.ui import make_embed
 
 CATEGORY_ICONS = {
-    "Information": "search", "Moderation": "gavel", "Welcome": "gift", "Giveaway": "gift",
+    "Information": "search", "Welcome": "gift", "Giveaway": "gift",
     "Aliases": "link", "Tickets": "clipboard", "Automod": "lock", "Backup": "folder", "NoPrefix": "star", "Help": "compass", "Errors": "warn",
-    "BadgeAdmin": "shield", "AntiNuke": "shield",
+    "BadgeAdmin": "shield", "AntiNuke": "shield", "ImageHost": "image",
 }
 
 
-ADMIN_COGS = {"Moderation", "Tickets", "Automod", "Welcome", "Giveaway", "Aliases", "NoPrefix", "Backup", "BadgeAdmin", "AntiNuke"}
+ADMIN_COGS = {"Tickets", "Automod", "Welcome", "Giveaway", "Aliases", "NoPrefix", "Backup", "BadgeAdmin", "AntiNuke", "ImageHost"}
 
 
 def is_staff(ctx: commands.Context) -> bool:
@@ -193,7 +193,7 @@ class Help(commands.Cog):
 
     @commands.hybrid_command(
         name="adminhelp", aliases=["admin", "ahelp"],
-        description="Admin commands: moderation, tickets, automod, backup... (staff only)",
+        description="Admin commands: tickets, automod, backup... (staff only)",
     )
     async def adminhelp(self, ctx: commands.Context) -> None:
         if not is_staff(ctx):

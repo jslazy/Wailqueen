@@ -46,14 +46,14 @@ class Aliases(commands.Cog):
         await ctx.send(
             embed=make_embed(
                 f"{icon('link')} Command aliases",
-                f"`{p}alias add <command> <new name>` • example: `{p}alias add warn w`\n"
+                f"`{p}alias add <command> <new name>` • example: `{p}alias add ping p`\n"
                 f"`{p}alias remove <name>`\n"
                 f"`{p}alias list`",
             )
         )
 
     @alias.command(name="add", description="Give a command a new short name.")
-    @app_commands.describe(command="The command, e.g. warn.", new_alias="The new short name, e.g. w.")
+    @app_commands.describe(command="The command, e.g. ping.", new_alias="The new short name, e.g. p.")
     @commands.guild_only()
     @commands.has_permissions(administrator=True)
     async def alias_add(self, ctx: commands.Context, command: str, new_alias: str) -> None:

@@ -83,34 +83,10 @@ class Information(commands.Cog):
         await ctx.send(embed=embed)
 
     # -------------------------------------------------------------- userinfo
-    def _case_summary(self, guild_id: int, user_id: int) -> list[str]:
-        """Moderation cases of a member: total, split by type, and the last 3."""
-        rows = self.bot.db.conn.execute(  # type: ignore[attr-defined]
-            "SELECT id, action, reason, created_at FROM mod_cases WHERE guild_id=? AND user_id=? ORDER BY id DESC",
-            (guild_id, user_id),
-        ).fetchall()
-        if not rows:
-            return ["Total cases: **0**"]
-        counts: dict[str, int] = {}
-        for _, action, _, _ in rows:
-            counts[action] = counts.get(action, 0) + 1
-        split = " • ".join(
-            f"{label} {counts[key]}"
-            for key, label in (("warn", "Warns"), ("timeout", "Timeouts"), ("kick", "Kicks"), ("ban", "Bans"))
-            if counts.get(key)
-        )
-        lines = [f"Total cases: **{len(rows)}**" + (f" ({split})" if split else ""), "Last 3 cases:"]
-        for case_id, action, reason, created in rows[:3]:
-            reason = (reason or "No reason").replace("\n", " ")
-            reason = reason if len(reason) <= 45 else reason[:44] + "…"
-            when = discord.utils.format_dt(datetime.fromisoformat(created), "R")
-            lines.append(f"`#{case_id}` **{action.title()}** • {reason} • {when}")
-        return lines
-
     @commands.hybrid_command(
         name="userinfo",
         aliases=["user", "ui", "whois", "profile"],
-        description="Show information about a member, including moderation cases.",
+        description="Show information about a member.",
     )
     @app_commands.describe(member="The member to look up. Defaults to you.")
     @commands.guild_only()
@@ -148,9 +124,6 @@ class Information(commands.Cog):
             "**Voice information**",
             "Current voice channel: "
             + (f"**{member.voice.channel.name}**" if member.voice and member.voice.channel else "**Not in voice**"),
-            "",
-            "**Moderation cases**",
-            *self._case_summary(ctx.guild.id, member.id),
         ]
 
         embed = make_embed(description="\n".join(lines), color=member.color.value or config.ACCENT)

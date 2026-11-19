@@ -129,6 +129,20 @@ CREATE TABLE IF NOT EXISTS images (
     filename TEXT NOT NULL,
     data BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS image_host (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    channel_id INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS image_links (
+    channel_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    filename TEXT NOT NULL DEFAULT 'image',
+    url TEXT NOT NULL,
+    guild_id INTEGER,
+    user_id INTEGER,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (channel_id, message_id)
+);
 CREATE TABLE IF NOT EXISTS giveaways (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id INTEGER NOT NULL,

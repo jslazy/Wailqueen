@@ -9,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
-from utils import images
+from utils import images, imagehost
 from utils.icons import icon
 
 log = logging.getLogger("premium-bot.welcome")
@@ -71,18 +71,11 @@ class WelcomeEditModal(discord.ui.Modal, title="Edit Welcome Message"):
             max_length=10,
             required=False,
         )
-        self.banner_in = discord.ui.TextInput(
-            label="Banner image link (shown below embed)",
-            placeholder="https://... | empty = keep current | remove = delete banner",
-            max_length=1000,
-            required=False,
-        )
         for item in (
             self.content_in,
             self.title_in,
             self.desc_in,
             self.color_in,
-            self.banner_in,
         ):
             self.add_item(item)
 
@@ -95,19 +88,46 @@ class WelcomeEditModal(discord.ui.Modal, title="Edit Welcome Message"):
             description=self.desc_in.value,
             color=self.color_in.value or "random",
         )
-        note = ""
-        raw = (self.banner_in.value or "").strip()
-        if raw.lower() in ("remove", "none", "delete"):
-            changes["banner"] = ""
-        elif raw:
-            try:
-                changes["banner"] = await images.store(self.cog.db, raw)  # only the link is saved
-            except images.ImageError as exc:
-                note = f"\n{icon('warn')} Banner not changed: {exc}"
         self.cog.save_cfg(interaction.guild_id, **changes)
         content, embed, files = self.cog.build_message(interaction.user)
-        await interaction.followup.send(f"{icon('ok')} Welcome message updated.{note} Preview:", ephemeral=True)
+        await interaction.followup.send(
+            f"{icon('ok')} Welcome message updated. Use the buttons to change the banner. Preview:",
+            view=BannerView(self.cog, interaction.user.id), ephemeral=True,
+        )
         await interaction.followup.send(content=content, embed=embed, files=files, ephemeral=True)
+
+
+class BannerView(discord.ui.View):
+    """Upload / remove the welcome banner (upload only, no pasted links)."""
+
+    def __init__(self, cog: "Welcome", author_id: int) -> None:
+        super().__init__(timeout=600)
+        self.cog, self.author_id = cog, author_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(f"{icon('lock')} These buttons are not yours.", ephemeral=True)
+            return False
+        return True
+
+    async def _preview(self, interaction: discord.Interaction, text: str) -> None:
+        await interaction.followup.send(text, ephemeral=True)
+        if isinstance(interaction.user, discord.Member):
+            content, embed, files = self.cog.build_message(interaction.user)
+            await interaction.followup.send(content=content, embed=embed, files=files, ephemeral=True)
+
+    @discord.ui.button(label="Upload banner", emoji=icon("banner"), style=discord.ButtonStyle.primary)
+    async def upload(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        marker = await imagehost.ask_image(interaction, self.cog.bot, author_id=self.author_id, what="welcome banner")
+        if marker is None:
+            return
+        self.cog.save_cfg(interaction.guild_id, banner=marker)  # type: ignore[arg-type]
+        await self._preview(interaction, f"{icon('ok')} Welcome banner {'saved' if marker else 'removed'}. Preview:")
+
+    @discord.ui.button(label="Remove banner", style=discord.ButtonStyle.secondary)
+    async def remove(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.cog.save_cfg(interaction.guild_id, banner="")  # type: ignore[arg-type]
+        await interaction.response.send_message(f"{icon('ok')} Welcome banner removed.", ephemeral=True)
 
 
 class Welcome(commands.Cog):
@@ -274,37 +294,37 @@ class Welcome(commands.Cog):
     @commands.hybrid_command(
         name="welcomebanner",
         aliases=["wbanner"],
-        description="Set the welcome banner: upload an image or give a link. 'remove' deletes it.",
+        description="Set the welcome banner by uploading an image. Type 'remove' to delete it.",
     )
-    @app_commands.describe(link="Direct image link, or 'remove'.", image="Or upload the banner image here.")
+    @app_commands.describe(option="Type 'remove' to delete the banner.", image="Upload the banner image here.")
     @app_commands.default_permissions(manage_guild=True)
     @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
     async def welcomebanner(
-        self, ctx: commands.Context, link: Optional[str] = None, image: Optional[discord.Attachment] = None
+        self, ctx: commands.Context, option: Optional[str] = None, image: Optional[discord.Attachment] = None
     ) -> None:
         assert ctx.guild is not None
         if image is None and ctx.message is not None and ctx.message.attachments:
             image = ctx.message.attachments[0]
-        if link and link.lower() in ("remove", "none", "delete"):
+        if option and option.lower() in ("remove", "none", "delete"):
             self.save_cfg(ctx.guild.id, banner="")
             return await ctx.send(f"{icon('ok')} Welcome banner removed.")
-        source = image.url if image is not None else link
-        if not source:
+        if image is None:
             return await ctx.send(
-                f"{icon('warn')} Upload an image with the command, or give a direct image link.\n"
-                f"Example: `{config.PREFIX}welcomebanner https://.../banner.png`",
+                f"{icon('warn')} Upload the banner image together with the command "
+                f"(`{config.PREFIX}welcomebanner` + attached image). Links are not accepted.\n"
+                f"`{config.PREFIX}welcomebanner remove` deletes the banner.",
                 ephemeral=True,
             )
         try:
-            marker = await images.store(self.db, source)  # only the link is saved
+            marker = await imagehost.host_attachment(self.bot, image, guild_id=ctx.guild.id, user_id=ctx.author.id)
         except images.ImageError as exc:
             return await ctx.send(f"{icon('warn')} {exc}", ephemeral=True)
         self.save_cfg(ctx.guild.id, banner=marker)
         if isinstance(ctx.author, discord.Member):
             content, embed, files = self.build_message(ctx.author)
             await ctx.send(content=content, embed=embed, files=files)
-        await ctx.send(f"{icon('ok')} Welcome banner link saved (preview above).")
+        await ctx.send(f"{icon('ok')} Welcome banner saved (preview above).")
 
 
 async def setup(bot: commands.Bot) -> None:

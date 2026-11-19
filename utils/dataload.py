@@ -36,6 +36,7 @@ NATURAL = {
     "welcome": ["guild_id"], "guild_settings": ["guild_id"], "command_aliases": ["guild_id", "alias"],
     "custom_badges": ["user_id", "badge"], "badge_emojis": ["badge"], "no_prefix": ["user_id"],
     "ticket_config": ["guild_id"], "automod_config": ["guild_id"], "images": ["key"],
+    "image_host": ["id"], "image_links": ["channel_id", "message_id"],
 }
 # tables with an auto id: a row counts as "the same" when these columns match
 IDTABLES = {
